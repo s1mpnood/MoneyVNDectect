@@ -3,7 +3,8 @@ import glob
 import cv2
 import numpy as np
 import pickle
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score
 
@@ -11,14 +12,13 @@ DENOMS = ["10k", "20k", "50k", "100k", "200k", "500k"]
 TEMPLATES_DIR = "templates"
 IMAGE_SIZE = (200, 100)
 
-# Vietnamese money color ranges in HSV (approximate)
 MONEY_COLORS = {
-    "10k": [(90, 50, 50), (130, 255, 255)],   # Blue-ish
-    "20k": [(90, 50, 50), (130, 255, 255)],   # Blue
-    "50k": [(35, 50, 50), (85, 255, 255)],    # Green
-    "100k": [(35, 50, 50), (85, 255, 255)],   # Green
-    "200k": [(0, 50, 50), (20, 255, 255)],    # Red/Brown
-    "500k": [(100, 50, 50), (140, 255, 255)], # Blue
+    "10k": [(90, 50, 50), (130, 255, 255)],
+    "20k": [(90, 50, 50), (130, 255, 255)],
+    "50k": [(35, 50, 50), (85, 255, 255)],
+    "100k": [(35, 50, 50), (85, 255, 255)],
+    "200k": [(0, 50, 50), (20, 255, 255)],
+    "500k": [(100, 50, 50), (140, 255, 255)],
 }
 
 
@@ -57,19 +57,32 @@ def detect_money(img):
         return img
     
     h_img, w_img = img.shape[:2]
-    min_area = h_img * w_img * 0.1  # At least 10% of image
     
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    detect_width = 640
+    scale = 1.0
+    if w_img > detect_width:
+        scale = detect_width / w_img
+        work_img = cv2.resize(img, (detect_width, int(h_img * scale)))
+    else:
+        work_img = img
+        
+    h_work, w_work = work_img.shape[:2]
+    min_area = h_work * w_work * 0.1
+    
+    gray = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # Try multiple edge detection thresholds
     best_contour = None
     best_area = 0
     
-    for thresh1, thresh2 in [(30, 100), (50, 150), (20, 80)]:
-        edges = cv2.Canny(blurred, thresh1, thresh2)
+    _, thresh_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    edges_canny = cv2.Canny(blurred, 50, 150)
+    thresh_adapt = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 19, 5)
+    
+    candidates = [thresh_otsu, edges_canny, thresh_adapt]
+    for binary_map in candidates:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+        closed = cv2.morphologyEx(binary_map, cv2.MORPH_CLOSE, kernel)
         
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
@@ -81,14 +94,17 @@ def detect_money(img):
             x, y, w, h = cv2.boundingRect(cnt)
             aspect_ratio = w / h if h > 0 else 0
             
-            # Vietnamese banknotes have aspect ratio ~2.2:1
-            if 1.5 < aspect_ratio < 3.0 and area > best_area:
+            if 1.2 < aspect_ratio < 3.5 and area > best_area:
                 best_area = area
                 best_contour = (x, y, w, h)
     
     if best_contour:
         x, y, w, h = best_contour
-        # Add small padding
+        x = int(x / scale)
+        y = int(y / scale)
+        w = int(w / scale)
+        h = int(h / scale)
+        
         pad = 5
         x = max(0, x - pad)
         y = max(0, y - pad)
@@ -96,7 +112,10 @@ def detect_money(img):
         h = min(h_img - y, h + 2 * pad)
         return img[y:y+h, x:x+w]
     
-    return img
+    cy, cx = h_img // 2, w_img // 2
+    ch, cw = int(h_img * 0.8), int(w_img * 0.8)
+    y, x = cy - ch//2, cx - cw//2
+    return img[y:y+ch, x:x+cw]
 
 
 def _safe_resize(img, size):
@@ -110,10 +129,8 @@ def _safe_resize(img, size):
 
 
 def extract_color_features(img):
-    img = _safe_resize(img, IMAGE_SIZE)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     
-    # HSV histograms
     hist_h = cv2.calcHist([hsv], [0], None, [36], [0, 180])
     hist_s = cv2.calcHist([hsv], [1], None, [32], [0, 256])
     hist_v = cv2.calcHist([hsv], [2], None, [32], [0, 256])
@@ -122,7 +139,6 @@ def extract_color_features(img):
     cv2.normalize(hist_s, hist_s)
     cv2.normalize(hist_v, hist_v)
     
-    # BGR histograms for additional color info
     hist_b = cv2.calcHist([img], [0], None, [32], [0, 256])
     hist_g = cv2.calcHist([img], [1], None, [32], [0, 256])
     hist_r = cv2.calcHist([img], [2], None, [32], [0, 256])
@@ -131,7 +147,6 @@ def extract_color_features(img):
     cv2.normalize(hist_g, hist_g)
     cv2.normalize(hist_r, hist_r)
     
-    # Color moments (mean, std)
     moments = []
     for ch in cv2.split(hsv):
         moments.extend([np.mean(ch) / 255.0, np.std(ch) / 255.0])
@@ -144,10 +159,8 @@ def extract_color_features(img):
 
 
 def extract_texture_features(img):
-    img = _safe_resize(img, IMAGE_SIZE)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Sobel gradients
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(gx, gy)
@@ -160,12 +173,10 @@ def extract_texture_features(img):
     hist_mag = cv2.calcHist([mag_norm], [0], None, [32], [0, 256])
     cv2.normalize(hist_mag, hist_mag)
     
-    # Gradient orientation histogram (HOG-like)
     angle_norm = (angle / 360.0 * 255).astype(np.uint8)
     hist_angle = cv2.calcHist([angle_norm], [0], None, [18], [0, 256])
     cv2.normalize(hist_angle, hist_angle)
     
-    # LBP-like texture (simplified)
     lbp_features = []
     for ksize in [3, 5]:
         lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=ksize)
@@ -178,21 +189,19 @@ def extract_texture_features(img):
 
 
 def extract_cnn_features(img):
-    img = _safe_resize(img, IMAGE_SIZE)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
     
     kernels = [
-        np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]]),      # Sobel X
-        np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]]),      # Sobel Y
-        np.array([[0, -1, 0], [-1, 4, -1], [0, -1, 0]]),     # Laplacian
-        np.array([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]]), # Edge
-        np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]]) / 9.0,   # Blur
+        np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]]),
+        np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]]),
+        np.array([[0, -1, 0], [-1, 4, -1], [0, -1, 0]]),
+        np.array([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]]),
+        np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]]) / 9.0,
     ]
     
     features = []
     for k in kernels:
         filtered = cv2.filter2D(gray, -1, k.astype(np.float32))
-        # Multi-scale pooling
         pooled1 = cv2.resize(np.abs(filtered), (10, 5))
         pooled2 = cv2.resize(np.abs(filtered), (5, 3))
         features.append(pooled1.flatten())
@@ -203,22 +212,19 @@ def extract_cnn_features(img):
 
 def extract_shape_features(img):
     """Extract shape-based features specific to banknotes."""
-    img = _safe_resize(img, IMAGE_SIZE)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Corner detection
     corners = cv2.cornerHarris(gray, 2, 3, 0.04)
     corner_count = np.sum(corners > 0.01 * corners.max())
     
-    # Edge density in different regions
     edges = cv2.Canny(gray, 50, 150)
     h, w = edges.shape
     regions = [
-        edges[:h//2, :],           # Top
-        edges[h//2:, :],           # Bottom
-        edges[:, :w//2],           # Left
-        edges[:, w//2:],           # Right
-        edges[h//4:3*h//4, w//4:3*w//4]  # Center
+        edges[:h//2, :],
+        edges[h//2:, :],
+        edges[:, :w//2],
+        edges[:, w//2:],
+        edges[h//4:3*h//4, w//4:3*w//4]
     ]
     edge_densities = [np.mean(r) / 255.0 for r in regions]
     
@@ -229,10 +235,12 @@ def extract_all_features(img):
     if img is None or img.size == 0:
         return np.array([])
     
-    color = extract_color_features(img)
-    texture = extract_texture_features(img)
-    cnn = extract_cnn_features(img)
-    shape = extract_shape_features(img)
+    img_resized = _safe_resize(img, IMAGE_SIZE)
+    
+    color = extract_color_features(img_resized)
+    texture = extract_texture_features(img_resized)
+    cnn = extract_cnn_features(img_resized)
+    shape = extract_shape_features(img_resized)
     
     features = np.concatenate([color, texture, cnn, shape])
     norm = np.linalg.norm(features)
@@ -246,33 +254,16 @@ def augment_image(img):
     augmented = [img]
     h, w = img.shape[:2]
     
-    # Horizontal flip
     augmented.append(cv2.flip(img, 1))
     
-    # Rotations
-    for angle in [-5, 5, -10, 10]:
+    for angle in [-5, 5]:
         M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
         rotated = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
         augmented.append(rotated)
     
-    # Brightness variations
-    for beta in [-30, -15, 15, 30]:
+    for beta in [-20, 20]:
         bright = cv2.convertScaleAbs(img, alpha=1.0, beta=beta)
         augmented.append(bright)
-    
-    # Contrast variations
-    for alpha in [0.8, 1.2]:
-        contrast = cv2.convertScaleAbs(img, alpha=alpha, beta=0)
-        augmented.append(contrast)
-    
-    # Scale augmentation
-    for scale in [0.9, 1.1]:
-        scaled = cv2.resize(img, None, fx=scale, fy=scale)
-        scaled = cv2.resize(scaled, (w, h))
-        augmented.append(scaled)
-    
-    # Blur augmentation
-    augmented.append(cv2.GaussianBlur(img, (3, 3), 0))
     
     return augmented
 
@@ -305,6 +296,8 @@ def load_data():
                 if cropped is None or cropped.size == 0:
                     cropped = img
                 
+                cropped = _safe_resize(cropped, IMAGE_SIZE)
+                
                 preprocessed = preprocess_image(cropped)
                 
                 for aug_img in augment_image(preprocessed):
@@ -318,8 +311,10 @@ def load_data():
                 _log_debug(f"Error processing {path}: {e}")
                 continue
             
-            if (i + 1) % 50 == 0:
-                _log_debug(f"{label}: processed {i+1}")
+            if (i + 1) % 5 == 0 or (i + 1) == len(paths):
+                percent = (i + 1) / len(paths) * 100
+                print(f"  Processing {label}: {i + 1}/{len(paths)} ({percent:.1f}%)", end='\r')
+        print()
     
     return np.array(X), np.array(y)
 
@@ -336,7 +331,7 @@ def build_orb_templates():
         paths = _get_image_paths(folder)
         
         all_des = []
-        for path in paths[:10]:  # Use up to 10 images for better templates
+        for path in paths[:10]:
             try:
                 img = cv2.imread(path)
                 if img is None:
@@ -402,7 +397,6 @@ def train():
             print("\nERROR: Need at least 2 classes to train")
             return
         
-        # Stratify only if all classes have enough samples
         min_count = min(np.sum(y == label) for label in classes_found)
         use_stratify = min_count >= 2
         
@@ -414,11 +408,15 @@ def train():
         print(f"\nTraining set: {len(X_train)}")
         print(f"Test set: {len(X_test)}")
         
-        print("\nTraining KNN classifier...")
-        clf = KNeighborsClassifier(n_neighbors=5, weights='distance', metric='euclidean')
-        clf.fit(X_train, y_train)
+        print("\nTraining CNN-Feature based Classifier (SVM)...")
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
         
-        y_pred = clf.predict(X_test)
+        clf = SVC(kernel='rbf', C=10, gamma='scale', probability=True, random_state=42)
+        clf.fit(X_train_scaled, y_train)
+        
+        y_pred = clf.predict(X_test_scaled)
         acc = accuracy_score(y_test, y_pred)
         print(f"\nAccuracy: {acc*100:.2f}%\n")
         print(classification_report(y_test, y_pred, zero_division=0))
@@ -428,6 +426,7 @@ def train():
         
         model = {
             "clf": clf,
+            "scaler": scaler,
             "templates": templates,
             "image_size": IMAGE_SIZE,
             "feature_length": int(X.shape[1]),
